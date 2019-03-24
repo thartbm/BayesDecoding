@@ -1,0 +1,454 @@
+---
+title: "Bayesian Decoding at CoSMo"
+author: "Marius 't Hart"
+output:
+  html_document:
+    df_print: paged
+  html_notebook: default
+  pdf_document: default
+---
+
+> Data: Lee Miller & Jim Rebesco
+
+> Exercise: Gunnar Blohm
+
+> Downloaded from: [CoSMo Wiki](http://compneurosci.com/wiki/index.php/CoSMo_2013) (on March 8th, 2019: Afternoon Tutorial 2 from the two introductory days)
+
+
+```{r setup, cache=FALSE, include=FALSE}
+library(knitr)
+#opts_chunk$set(comment='', eval=FALSE)
+```
+
+_The goal of this assignment is to gain experience using Bayesian statistical methods, such as used for multi-sensory integration, optimal feedback control, Kalman filtering, etc. As an example, we will use neural spike rates from different neurons and apply a Bayesian decoder to infer movement direction._
+
+# Basic statistics
+
+In the first part of the tutorial you will see how well individual neurons can decode a movement from those neurons' firing rates.
+
+_Please download the data set and familiarize yourself with it. It contains firing rate data of 35 neurons over 205 trials (curtesy of Lee Miller and Jim Rebesco)._
+
+For this tutorial, the data is stored as an R data frame:
+
+```{r}
+load('data/neuronrates.rda')
+```
+
+The first column indicates a movement direction (it is unsure to me if these are eye- or hand movements, or something else), which is one of two directions. And while I don't actually know the movement directions, I labeled them left and right, all the same, to make things a bit more tangible. What is also not clear - but we may guess this - is if these are single-cell recordings, if they are from macaques, and if the spikes rates were recorded simultaneously from all 35 neurons during the same movements. We also don't know what area(s) the neurons were in, or if the recordings were done during preparation of the movement, during the movement, both, or even at some other time.
+
+For the exercise it doesn't matter much, so we can simply imagine what all this data means.
+
+We might be interested in basic distribution of the two kinds of variables: direction and firing rates. Let's have a look at the directions first.
+
+```{r}
+summary(neuronrates$direction)
+```
+
+The movement directions are almost equally distributed. If we'd guess 'right' all the time, we'd be 50.73% correct, less than a percent above chance. While we might make it equal by removing a few of the right ward trials, it won't matter a lot.
+
+Now, let's get a summary of the other columns:
+
+```{r}
+summary(as.vector(unlist(neuronrates[2:36])))
+```
+
+The minimum spike rate in the data appears to be 0. We can assume this means that some neurons did not fire at all in some intervals. The maximum firing rate is over a 100 (spikes/second?) and it would seem that the data in it's entirety is not really normally distributed.
+
+We plot the data to get a little more familiar with it. We'll do this as two density plots in each subplot, one for left movements (blue), and one for right movements (red). This way we can already get an idea of how well a given neuron can distinguish between left or right movements.
+
+```{r}
+
+par(mfrow=c(5,7),mar=c(0,0,2,0))
+
+for (neuron in sprintf('n%02d',c(1:35))) {
+  ld <- density(neuronrates[which(neuronrates$direction == 'left'),neuron])
+  rd <- density(neuronrates[which(neuronrates$direction == 'right'),neuron])
+  xlim <- c(min(c(range(ld$x),range(rd$x))),max(c(range(ld$x),range(rd$x))))
+  ylim <- c(0,max(c(range(ld$y),range(rd$y))))
+  plot(-1000,-1000,main=neuron,xlim=xlim,ylim=ylim,xlab='',ylab='',bty='n',ax=F)
+  lines(ld$x,ld$y,col='blue')
+  lines(rd$x,rd$y,col='red')
+}
+
+```
+
+Some neurons fire more when the movement is to the right (2 and 13), and some fire more when the movement is to the left (15 and 23). Most of the distributions look fairly normal. There are also some neurons that seem to provide almost no information (3) or that have very different density curves for left and right movements (19). It seems that even with just the last 7 neurons in this plot (n29 - n35) we should be able to make highly accurate decisions on which directions a bunch of spike rates was taken from.
+
+Let's look at neuron 19 a bit more, to see why it has these density curves.
+
+```{r}
+l19 <- neuronrates[which(neuronrates$direction == 'left'),'n19']
+r19 <- neuronrates[which(neuronrates$direction == 'right'),'n19']
+print(l19)
+print(r19)
+summary(l19)
+summary(r19)
+
+```
+
+So this neuron is highly selective, with almost no firing for "left" movements, and more distributed firing for "right" movements. Because all the 0 firing rates are on top of each other for left movements, this creates a big peak around 0 for that density plot, while the density plot for right movement spike rates is probably more similar to that of other neurons - but we can't see the y-axis scale as they were left out of the figure to save space.
+
+_Identify the firing rate distributions for each neuron (suppose they’re Gaussian)._
+
+Each neuron will have _two_ firing rate distributions: one for left movements, and one for right movements. If we look at the help page for `dnorm()` we see that a normal (or Gaussian) distribution can be described by it's mean and standard deviation. For example, the default mean is 0 and the default standard deviation is 1. This gives a density function like this:
+
+```{r}
+plot(seq(-3.5,3.5,.01),dnorm(seq(-3.5,3.5,.01)),type='l',bty='n',
+     xlab='value',ylab='density',main='normal distribution function')
+```
+
+If we'd represent each neuron's firing rates (given either left or right movement) as such a distribution, then we can use this `dnorm()` function to get the exact probability of observing this particular firing rate given the movement direction the normal distribution was based on. In other words: it _should_ work for un-observed trials, but I guess we're ignoring that part for now.
+
+By getting the mean and standard deviation for every neuron's left and right movement firing rates, we can describe all the data as 35 neurons x 2 movement directions = 70 normal distributions. And each of those normal distributions only need a mean and a standard deviation, so that's a pretty sparse representation. Let's put this in a data frame (long-format, R-friendly):
+
+```{r}
+# we create some vectors to store everything while going through the data:
+neuron <- c() # the neuron's ID
+movement <- c() # left or right
+mu <- c() # the mean firing rate
+sigma <- c() # the standard deviation of the firing rate
+
+for (neuron.ID in sprintf('n%02d',c(1:35))) {
+  for (movdir in unique(neuronrates$direction)) {
+    spikerates <- neuronrates[which(neuronrates$direction == movdir),neuron.ID]
+    neuron   <- c(neuron,   neuron.ID)
+    movement <- c(movement, movdir)
+    mu       <- c(mu,       mean(spikerates))
+    sigma    <- c(sigma,    sd(spikerates))
+  }
+  # spikerates <- neuronrates[,neuron.ID]
+  # neuron   <- c(neuron,   neuron.ID)
+  # movement <- c(movement, 'both')
+  # mu       <- c(mu,       mean(spikerates))
+  # sigma    <- c(sigma,    sd(spikerates))
+}
+
+spikedist <- data.frame(neuron, movement, mu, sigma)
+
+```
+
+_Compute and plot the likelihoods for each neuron N: p(N|Left) and p(N|Right)_
+
+We're supposed to plot likelihoods, and what is meant is probably likelihood _distributions_ of _firing rates_. Since these are probabilities of the neuron having a specific firing rate _given_ that the movement was right or left, we don't have to consider much yet. So basically, we're going to create the same plot as the density plot above, but with the normal distributions that we just got.
+
+```{r}
+par(mfrow=c(5,7),mar=c(0,0,2,0))
+
+x <- seq(0,110,.1)
+
+for (neuron in unique(spikedist$neuron)) {
+  l.mu <- spikedist$mu[which(spikedist$neuron == neuron & spikedist$movement == 'left')]
+  l.sigma <- spikedist$sigma[which(spikedist$neuron == neuron & spikedist$movement == 'left')]
+  l.dist <- dnorm(x,mean=l.mu,sd=l.sigma)
+  r.mu <- spikedist$mu[which(spikedist$neuron == neuron & spikedist$movement == 'right')]
+  r.sigma <- spikedist$sigma[which(spikedist$neuron == neuron & spikedist$movement == 'right')]
+  r.dist <- dnorm(x,mean=r.mu,sd=r.sigma)
+  
+  plot(-1000,-1000,main=neuron,xlim=range(x),ylim=c(0,max(max(l.dist),max(r.dist))),bty='n',ax=F)
+  
+  lines(x,l.dist,col='blue')
+  lines(x,r.dist,col='red')
+}
+
+```
+
+Except maybe for neurons 3, 8 and 33 the distributions don't overlap totally, so we have at least 32 neurons that can tell us something about the direction of movement given the firing rates. And even those 3 will give a little bit of information, that is: they won't make our predictions worse, but they can make them a little bit better.
+
+_Do the same for the posterior probabilities. How well do likelihood and posteriors code for movement direction? Hint: for the marginal, remember you have to sum over all options._
+
+As a reminder, we can look up some information on these types of probabilities on the internet. For example:
+
+P(A|B) = P(B|A) * P(A) / P(B)
+
+For those who like actual equations better:
+
+$p(A|B) = \frac{p(B|A) \cdot p(A)}{p(B)}$
+
+Which we can translate to our own situation:
+
+p(right|rate) = p(rate|right) * p(right) / p(rate)
+
+> _"The probability of the movement going to the right, given the observed firing rate is equal to the probability of the firing rate given that the movement is going to the right times the probability that the movement is going to the right, divided by the probability of observing this firing rate."_
+
+It seems pretty clear how to do this for a single neuron. Of course, it will start to become more interesting if we have more neurons, but let's first do this for all single neurons first. So here's a function that should return the posterior:
+
+```{r}
+probabilityRightNeuron <- function(ratedist,neuron,rate) {
+  
+  r.idx   <- which(ratedist$neuron == neuron & ratedist$movement == 'right')
+  r.mu    <- ratedist$mu[r.idx]
+  r.sigma <- ratedist$sigma[r.idx]
+  
+  l.idx   <- which(ratedist$neuron == neuron & ratedist$movement == 'left')
+  l.mu    <- ratedist$mu[l.idx]
+  l.sigma <- ratedist$sigma[l.idx]
+  
+  b.idx   <- which(ratedist$neuron == neuron & ratedist$movement == 'both')
+  b.mu    <- ratedist$mu[b.idx]
+  b.sigma <- ratedist$sigma[b.idx]
+  
+  p_right      <- 104/(101+104)
+  #p_right      <- 1
+  
+  #p_rate       <- dnorm(rate, mean=b.mu, sd=b.sigma)
+  #p_rate       <- dnorm(rate, mean=r.mu, sd=r.sigma) + dnorm(rate, mean=l.mu, sd=l.sigma)
+  p_rate       <- (dnorm(rate, mean=r.mu, sd=r.sigma) + dnorm(rate, mean=l.mu, sd=l.sigma))/2  
+  p_rate_right <- dnorm(rate, mean=r.mu, sd=r.sigma)
+  
+  return((p_rate_right * p_right)/p_rate)
+}
+
+probabilityLeftNeuron <- function(ratedist,neuron,rate) {
+  
+  r.idx   <- which(ratedist$neuron == neuron & ratedist$movement == 'right')
+  r.mu    <- ratedist$mu[r.idx]
+  r.sigma <- ratedist$sigma[r.idx]
+  
+  l.idx   <- which(ratedist$neuron == neuron & ratedist$movement == 'left')
+  l.mu    <- ratedist$mu[l.idx]
+  l.sigma <- ratedist$sigma[l.idx]
+  
+  p_left      <- 101/(101+104)
+
+  p_rate       <- (dnorm(rate, mean=r.mu, sd=r.sigma) + dnorm(rate, mean=l.mu, sd=l.sigma))/2  
+  p_rate_left <- dnorm(rate, mean=l.mu, sd=l.sigma)
+  
+  return((p_rate_left * p_left)/p_rate)
+}
+
+```
+
+Apparently, the probability of observing this firing rate is not well approximated by creating 1 distribution for the neuron based on all data (as I thought) but is better done by **adding** the probabilities of observing the firing rate in the two distributions, and dividing by two (although I wonder if this should be weighted).
+
+Anyway let's plot this for all those neurons, as I tweaked the above function by looking at the figure, and then seeing what went wrong.
+
+```{r}
+par(mfrow=c(5,7),mar=c(0,0,2,0))
+
+for (neuron in unique(spikedist$neuron)) {
+  
+  xlim <- range(neuronrates[,neuron])
+  
+  x <- seq(xlim[1],xlim[2],.01)
+  
+  r.y <- probabilityRightNeuron(ratedist=spikedist,neuron=neuron,rate=x)
+  l.y <- probabilityLeftNeuron(ratedist=spikedist,neuron=neuron,rate=x)
+  
+  plot(-1000,-1000,main=neuron,xlim=xlim,ylim=c(0,1),bty='n',ax=F)
+  
+  lines(x,r.y,col='red')
+  lines(x,l.y,col='blue')
+}
+
+```
+
+The y-axis in all these subplots goes from 0 to 1, and is the probability that the movement was to the right (red curves) or to the left (blue curves), given the firing rate of the neuron (x-axis), where the x-axis is scaled to the range of firing rates for each neuron. So where the curve is higher the chance of a movement to the right is higher. Conversely, when the curve is lower (than 50%) the chance of a movement to the left gets higher.
+
+Neurons with a clear switch from 0 to 1 are perhaps the most informative neurons, e.g. neurons 1 and 6, and many others. Those three neurons we noticed ealrier, because they had largely overlapping normal functions (3, 18 and 33) stand out in this figure as well, as they don't show a clear switch, but instead they are largely flat. We can see a very similar pattern for neurons 17 and 24, and when you look at them in the earlier plots, they have overlapping normal distributions too. Then there is another "class" of neurons that I can distinguish here. Those look like neuron 5, where the chance of a rightward movement first increases with increasing firing rate, but then decreases again. If you look closer at their normal distribution functions, you will see that this can be explained because the distributions overlap a great deal (though not completely) but one distribution clearly has a larger standard deviation than the other.
+
+We still haven't answered this part of the question: _How well do likelihood and posteriors code for movement direction?_ This sounds like we need to calculate decoding performance for each neuron. I'm going to assume we will not need to do a leave-one-out type solution, but can just see how many of the movements in the dataset are correctly decoded by the distributions we calculated for each neuron separately. That is, we get the ground truth from the first column of the raw data (`neuronrates$direction`). Then we loop through the neurons, and for each of them we get the probability of a rightward movement given the whole column of actual spike rates for that neuron, and compare it with the ground truth.
+
+```{r}
+# we want rightward movements as 1, and leftward as 0:
+groundtruth <- as.numeric(neuronrates$direction) - 1
+
+# we will store the decoding performance of every neuron:
+neuron <- c()
+performance <- c()
+
+# loop through neurons
+for (neuron.ID in unique(spikedist$neuron)) {
+  
+  # get the neurons actual spike rates:
+  spikerates <- neuronrates[,neuron.ID]
+  
+  # calculate the posteriors
+  posteriors <- probabilityRightNeuron(ratedist=spikedist,neuron=neuron.ID,rate=spikerates)
+  
+  # decoding is correct when:
+  # the posterior (of a right movement) is higher than 0.50 if the movement was to the right
+  # and also correct when the posterior is lower than 0.50 and the movement was to the left:
+  decodingperformance <- groundtruth == round(posteriors)
+  
+  # store the info:
+  neuron <- c(neuron, neuron.ID)
+  performance <- c(performance, mean(decodingperformance))
+  
+}
+
+# put it all in a data frame:
+neuronPerformance <- data.frame(neuron, performance)
+
+kable(neuronPerformance)
+summary(neuronPerformance$performance)
+```
+
+The minimum performance lies at 51% and the maximum at 99% with the mean and median both just below 75%. So there is a lot of variation in how informative the neurons are, but all of them are above chance. This already means that combining them will always be beneficial. In particular it would be interesting to see how well combined performance can be if we use the five "least informative" neurons (these are the ones that are less then 60% accurate).
+
+```{r}
+worstfive <- as.character(neuronPerformance$neuron[which(neuronPerformance$performance < .60)])
+worstfive
+```
+
+However, this is the end of the part about individual neurons.
+
+# Population decoding: iterative Bayesian (=Kalman)
+
+In this part, we will see how we can make use of the information provided by all neurons' firing rate simultaneously.
+
+_Now combine the individual neurons posteriors._
+_Here, previous decoding performance will act as a prior to the next iteration._
+_Note, this is only correct if all observations are statistically independent, which we will assume here._
+
+I'm going to assume we don't have to create new posterior distributions that combine the information from several neurons, but can simply use the posterior distributions we just computed. That is, we can start with a prior of 104 / (101 + 104) that the movement is to the right, and then use likelihood provided by one first neuron to update our beliefs in the posterior. We can then do the same using a second neuron and so on, until we have used all 35 neurons, and then we move on to the next movement / trial.
+
+We can use/add the neurons in a random order for every trial (and even repeat that many times for a confidence interval?) to see how the decoding performance increases with more neurons in the mix. Since individual neurons are all above chance, combined decoding performance should also be above 50% (and get close to 100%). Of course, if we start out with the 99% neuron by accident, performance will start out relatively high.
+
+Perhaps an alternative is to use the predictions of a set of neurons, and average them but weighted by their performance?
+
+For now we will do this:
+
+p(H | D) = p(D | H) * p(H) / p(D)
+
+So we update the probablity of the hypothesis (that the movement was to the right) given the information from some new data. Before seeing any data, our belief is the basic probability of seeing a rightward movement in the dataset. And then we apply this step on every new piece of data that comes in.
+
+In code, it will look like this:
+
+prior belief -> neuron 1 updates belief -> neuron 2 updates belief -> and so on... -> posterior belief
+
+Anyway, here I'm going to start putting the pieces that we do have together to make a function to do an iterative Bayesian approach.
+
+One way to do it is to simply 
+
+```{r}
+iterativeNaiveBayesianMovementDecoder <- function(neuronrates, ratedist, trial, useneurons='all') {
+  
+  # this is the prior probability (almost 50%)
+  prior <- 104/(101+104)
+  
+  # we'll store the iterative posteriors here:
+  posteriors <- c()
+  # the last one should be our final decision...
+  
+  if (useneurons == 'all') {
+    neurons <- sample(as.character(unique(ratedist$neuron)),length(unique(ratedist$neuron)))
+  } else if (useneurons == 'worstfive') {
+    neurons <- sample(c("n03", "n17", "n21", "n24", "n27"), 5)
+  }
+  
+  for (neuron in neurons) {
+    
+    # the firing rate of this neuron on this trial:
+    rate <- neuronrates[trial,neuron]
+    
+    # update beliefs with info from this neuron
+    r.idx   <- which(ratedist$neuron == neuron & ratedist$movement == 'right')
+    r.mu    <- ratedist$mu[r.idx]
+    r.sigma <- ratedist$sigma[r.idx]
+  
+    l.idx   <- which(ratedist$neuron == neuron & ratedist$movement == 'left')
+    l.mu    <- ratedist$mu[l.idx]
+    l.sigma <- ratedist$sigma[l.idx]
+    
+    # this is the probability of getting this rate if the movement is right:
+    p_rate_right <- dnorm(rate, mean=r.mu, sd=r.sigma)
+    
+    #p_rate       <- (dnorm(rate, mean=r.mu, sd=r.sigma) + dnorm(rate, mean=l.mu, sd=l.sigma))/2  
+    likelihood_r   <- dnorm(rate, mean=r.mu, sd=r.sigma)
+    likelihood_l   <- dnorm(rate, mean=l.mu, sd=l.sigma)
+    #normalization <- p_rate
+    
+    posterior_r <- (likelihood_r * prior)
+    posterior_l <- (likelihood_l * (1-prior))
+    
+    # I'm not actually sure how to calculate the normalizing constant, but since
+    # the two movement directions are mutually exclusive here, 
+    # the two posterior probabilities should add up to 1, and this should work:
+    posterior <- posterior_r / (posterior_r + posterior_l)
+    
+    posteriors <- c(posteriors, posterior)
+    
+    prior <- posterior
+    
+  }
+  
+  return(list('posteriors'=posteriors, 'neurons'=neurons))
+  
+}
+```
+
+We can see how well this does for either all neurons, or the worst five only:
+
+```{r}
+allYourBayes <- function(neuronrates, ratedist) {
+  
+  groundtruth <- as.numeric(neuronrates$direction) - 1
+  
+  alln <- matrix(NA, nrow=205, ncol=35)
+  worst <- matrix(NA, nrow=205, ncol=5)
+  
+  # there are 205 trials:
+  for (trial in c(1:205)) {
+    
+    a  <- iterativeNaiveBayesianMovementDecoder(neuronrates, ratedist, trial, useneurons='all')
+    w  <- iterativeNaiveBayesianMovementDecoder(neuronrates, ratedist, trial, useneurons='worstfive')
+    
+    alln[trial,]  <- (groundtruth[trial] == round(a$posteriors))
+    worst[trial,] <- (groundtruth[trial] == round(w$posteriors))
+    
+  }
+  
+  return(list('all'=colMeans(alln), 'worst'=colMeans(worst)))
+  
+}
+```
+
+Collect all the average posteriors, and plot them:
+
+```{r}
+performance <- allYourBayes(neuronrates, spikedist)
+plot(performance$all, type='l', col='red', ylim=c(0.45,1.00),main='naive iterative Bayes performance',xlab='N neurons',ylab='decoding performance',ax=F)
+lines(performance$worst, type='l', col='blue')
+axis(1,at=c(1,5,10,15,20,25,30,35))
+axis(2,at=c(0.5,0.6,0.7,0.8,0.9,1.0))
+```
+
+We could bootstrap confidence intervals for these curves, but I think this is enough for now. However, since the neurons are ordered randomly on each trial and the performance is then averaged, there are some random fluctuations that may pull performance down a little from X neurons to X+1 neurons. But in the end, when all available evidence has been used, the posterior should always be the same. So my prediction for a confidence interval is that it will not be an interval for neuron 35: it should always be the same number on every run.
+
+
+
+
+# Notes...
+
+All of the "update" steps integrate information from two sources. I've looked at Gunnar's slides from his 2013 "Sensory Motor" lecture, and he describes a Bayesian approach to this:
+
+p(X | A, B) = p(A, B | X) * p(X) / p(A, B)
+
+This integrates evidence from two sources A and B to update our belief in X. In our case, X could be the probability that the movement was to the right, and the two sources of information are the prior (A) and the firing rate of one neuron (B):
+
+p(right | prior, neuron) = p(prior, neuron | right) * p(right) / p(prior, neuron)
+
+Or as an equation:
+
+$p(right|prior,neuron) = \frac{p(prior,neuron|right)\cdot p(right)}{p(prior,neuron)}$
+
+Here, Gunnar's slides say that the term `p(prior, neuron | right)` is equal to: `p(prior | right) * p(neuron | right)`. And with uniform priors that is also the same as our updated belief. Perhaps we can make use of that in our case? We need to figure out what "uniform" means in this case.
+
+The term `p(neuron | right)` is the value of the normal distribution we fit for that neuron's firing rates with right movements, at the firing rate we currently have (we calculated this term in the other functions above). But we need to figure out `p(prior | right)`, and I have no idea where to start.
+
+**No, this is wrong.**
+
+===
+
+Gunnar has a slide on updating beliefs in a Kalman like manner, which might apply here:
+
+$p(x_k|z_k) = \frac{p(z_k|x_k) \cdot p(x_k|Z_{k-1})}{p(z_k|Z_{k-1})}$
+
+However, I'm not sure how to calculate all those terms. Primarily the terms that include $Z_{k-1}$. The first one seems to be how likely the category is given the previous iterations (is that the same as the prior on this iteration?), and the other one how likely the observation on the current iteration is, given the previous observations?
+
+The explanation: $Z_{k-1}=\{z_1 ... z_{k-1}\}$ makes it looks more like the set of all the previous evidence. In this case that would mean, how likely are we to observe this firing rate given all the other firing rates that we saw on the previous neurons? If so, it would probably make sense to normalize the firing rates, as the neurons don't have the same base rates at all.
+
+If it is a sequence of all the observations or pieces of evidence, then it seems that there is not one single belief (= a prior based on previous evidence) + one new piece of evidence that is used to update the one single belief, but we re-calculate a belief based on all the evidence we encountered (and remembered perfectly?). So do we get joint probabilities here? Is that what is meant, and are they considered independent?
+
+The formula doesn't make sense to me... yet
+
